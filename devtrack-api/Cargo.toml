@@ -1,0 +1,18 @@
+[package]
+name = "devtrack-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bb8 = "0.9"
+bb8-tiberius = "0.16"
+dotenvy = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+jsonwebtoken = "11.1.0"
+bcrypt = "0.19.3"
+tower-http = { version = "0.7.1", features = ["cors"] }
+tiberius = { version = "0.12", default-features = false, features = ["chrono", "rustls", "tds73", "winauth"] }
