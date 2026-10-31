@@ -58,75 +58,170 @@ pub async fn register(
 }
 
 // POST /api/auth/login
-// POST /api/auth/login
+
 pub async fn login(
     State(pool): State<DbPool>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<Json<AuthResponse>, (StatusCode, String)> {
-    let mut conn = pool.get().await.map_err(internal_error)?;
 
+    eprintln!("[LOGIN] 1. Login request received");
+
+    // 1. Acquire database connection
+    let mut conn = pool.get().await.map_err(|e| {
+        eprintln!("[LOGIN ERROR] Database connection: {}", e);
+        internal_error(e)
+    })?;
+
+    eprintln!("[LOGIN] 2. Database connection acquired");
+
+    // 2. Find user by email
     let stream = conn
         .query(
-            "SELECT id, name, email, password_hash, role FROM users WHERE email = @P1",
+            "SELECT id, name, email, password_hash, role
+             FROM users
+             WHERE email = @P1",
             &[&payload.email],
         )
         .await
-        .map_err(internal_error)?;
+        .map_err(|e| {
+            eprintln!("[LOGIN ERROR] User query: {}", e);
+            internal_error(e)
+        })?;
 
-    let row = stream.into_row().await.map_err(internal_error)?.ok_or((
-        StatusCode::UNAUTHORIZED,
-        "Invalid email or password".to_string(),
-    ))?;
+    eprintln!("[LOGIN] 3. User query executed");
 
-    let user_id: i32 = row.try_get("id").ok().flatten().unwrap_or_default();
+    // 3. Read query result
+    let row = stream
+        .into_row()
+        .await
+        .map_err(|e| {
+            eprintln!("[LOGIN ERROR] Reading user row: {}", e);
+            internal_error(e)
+        })?
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "Invalid email or password".to_string(),
+        ))?;
+
+    eprintln!("[LOGIN] 4. User found");
+
+    // 4. Extract user ID
+    let user_id = row
+        .try_get::<i32, _>("id")
+        .map_err(internal_error)?
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "User ID is missing".to_string(),
+        ))?;
+
+    // 5. Extract name
     let name = row
         .try_get::<&str, _>("name")
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .to_string();
-    let email = row
-        .try_get::<&str, _>("email")
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .to_string();
-    let hash_str = row
-        .try_get::<&str, _>("password_hash")
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .to_string();
-    let role = row
-        .try_get::<&str, _>("role")
-        .ok()
-        .flatten()
+        .map_err(internal_error)?
         .unwrap_or_default()
         .to_string();
 
-    let is_valid = verify(&payload.password, &hash_str).map_err(internal_error)?;
+    // 6. Extract email
+    let email = row
+        .try_get::<&str, _>("email")
+        .map_err(internal_error)?
+        .unwrap_or_default()
+        .to_string();
+
+    // 7. Extract password hash
+    let password_hash = row
+        .try_get::<&str, _>("password_hash")
+        .map_err(internal_error)?
+        .unwrap_or_default()
+        .to_string();
+
+    // 8. Extract role
+    let role = row
+        .try_get::<&str, _>("role")
+        .map_err(internal_error)?
+        .unwrap_or("Full-Stack Developer")
+        .to_string();
+
+    drop(row);
+
+    eprintln!("[LOGIN] 5. User information extracted");
+    eprintln!(
+        "[LOGIN] Password hash length: {}",
+        password_hash.len()
+    );
+
+    if password_hash.is_empty() {
+        eprintln!("[LOGIN ERROR] Stored password hash is empty");
+
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Stored password hash is missing".to_string(),
+        ));
+    }
+
+    // 9. Verify password
+    eprintln!("[LOGIN] 6. Starting password verification");
+
+    let is_valid = verify(&payload.password, &password_hash)
+        .map_err(|e| {
+            eprintln!("[LOGIN ERROR] Bcrypt verification: {}", e);
+            internal_error(e)
+        })?;
+
     if !is_valid {
+        eprintln!("[LOGIN] Invalid password for {}", email);
+
         return Err((
             StatusCode::UNAUTHORIZED,
             "Invalid email or password".to_string(),
         ));
     }
 
-    let token = create_jwt(user_id, &email).map_err(internal_error)?;
+    eprintln!("[LOGIN] 7. Password verified");
 
-    // Drop the connection borrow cleanly before getting a new one or returning
-    drop(conn);
+    // 10. Generate JWT
+    let token = create_jwt(user_id, &email).map_err(|e| {
+        eprintln!("[LOGIN ERROR] JWT generation: {}", e);
+        internal_error(e)
+    })?;
 
-    let profile = fetch_user_profile_by_id(&pool, user_id)
-        .await
-        .unwrap_or(UserProfile {
-            id: user_id,
-            name: name.clone(),
-            email: email.clone(),
-            role: role.clone(),
-            total_bugs_reported: 0,
-            open_bugs_count: 0,
-        });
+    eprintln!("[LOGIN] 8. JWT generated");
+
+    // 11. Fetch profile using the existing connection
+    let profile = match fetch_user_profile(&mut conn, user_id).await {
+        Ok(Some(profile)) => profile,
+
+        Ok(None) => {
+            eprintln!("[LOGIN] Profile not found, using basic profile");
+
+            UserProfile {
+                id: user_id,
+                name,
+                email,
+                role,
+                total_bugs_reported: 0,
+                open_bugs_count: 0,
+            }
+        }
+
+        Err((_, error)) => {
+            eprintln!(
+                "[LOGIN WARNING] Profile statistics query failed: {}",
+                error
+            );
+
+            UserProfile {
+                id: user_id,
+                name,
+                email,
+                role,
+                total_bugs_reported: 0,
+                open_bugs_count: 0,
+            }
+        }
+    };
+
+    eprintln!("[LOGIN] 9. Login successful");
 
     Ok(Json(AuthResponse {
         token,
@@ -134,64 +229,6 @@ pub async fn login(
     }))
 }
 
-// Separate helper that acquires its own connection from the pool safely
-async fn fetch_user_profile_by_id(
-    pool: &DbPool,
-    user_id: i32,
-) -> Result<UserProfile, (StatusCode, String)> {
-    let mut conn = pool.get().await.map_err(internal_error)?;
-    let sql = "
-        SELECT 
-            u.id, u.name, u.email, u.role,
-            COUNT(i.id) AS total_bugs,
-            ISNULL(SUM(CASE WHEN i.status = 'Open' THEN 1 ELSE 0 END), 0) AS open_bugs
-        FROM users u
-        LEFT JOIN issues i ON u.id = i.user_id
-        WHERE u.id = @P1
-        GROUP BY u.id, u.name, u.email, u.role
-    ";
-
-    let stream = conn.query(sql, &[&user_id]).await.map_err(internal_error)?;
-    let row_opt = stream.into_row().await.map_err(internal_error)?;
-
-    let row = row_opt.ok_or((StatusCode::NOT_FOUND, "User profile not found".to_string()))?;
-
-    Ok(UserProfile {
-        id: row
-            .try_get::<i32, _>("id")
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-        name: row
-            .try_get::<&str, _>("name")
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-            .to_string(),
-        email: row
-            .try_get::<&str, _>("email")
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-            .to_string(),
-        role: row
-            .try_get::<&str, _>("role")
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-            .to_string(),
-        total_bugs_reported: row
-            .try_get::<i32, _>("total_bugs")
-            .ok()
-            .flatten()
-            .unwrap_or(0),
-        open_bugs_count: row
-            .try_get::<i32, _>("open_bugs")
-            .ok()
-            .flatten()
-            .unwrap_or(0),
-    })
-}
 
 // GET /api/profile (Protected)
 pub async fn get_profile(
@@ -207,33 +244,85 @@ pub async fn get_profile(
     Ok(Json(profile))
 }
 
+
 async fn fetch_user_profile(
     conn: &mut bb8::PooledConnection<'_, bb8_tiberius::ConnectionManager>,
     user_id: i32,
 ) -> Result<Option<UserProfile>, (StatusCode, String)> {
+
     let sql = "
-        SELECT 
-            u.id, u.name, u.email, u.role,
-            COUNT(i.id) AS total_bugs,
-            SUM(CASE WHEN i.status = 'Open' THEN 1 ELSE 0 END) AS open_bugs
+        SELECT
+            u.id,
+            u.name,
+            u.email,
+            u.role,
+            CAST(COUNT(i.id) AS INT) AS total_bugs,
+            CAST(
+                ISNULL(
+                    SUM(
+                        CASE
+                            WHEN i.status = 'Open' THEN 1
+                            ELSE 0
+                        END
+                    ), 0
+                ) AS INT
+            ) AS open_bugs
         FROM users u
         LEFT JOIN issues i ON u.id = i.user_id
         WHERE u.id = @P1
         GROUP BY u.id, u.name, u.email, u.role
     ";
 
-    let stream = conn.query(sql, &[&user_id]).await.map_err(internal_error)?;
-    let row_opt = stream.into_row().await.map_err(internal_error)?;
+    let stream = conn
+        .query(sql, &[&user_id])
+        .await
+        .map_err(internal_error)?;
 
-    Ok(row_opt.map(|row| UserProfile {
-        id: row.get::<i32, _>("id").unwrap_or_default(),
-        name: row.get::<&str, _>("name").unwrap_or_default().to_string(),
-        email: row.get::<&str, _>("email").unwrap_or_default().to_string(),
-        role: row.get::<&str, _>("role").unwrap_or_default().to_string(),
-        total_bugs_reported: row.get::<i32, _>("total_bugs").unwrap_or(0),
-        open_bugs_count: row.get::<i32, _>("open_bugs").unwrap_or(0),
+    let row_opt = stream
+        .into_row()
+        .await
+        .map_err(internal_error)?;
+
+    let Some(row) = row_opt else {
+        return Ok(None);
+    };
+
+    Ok(Some(UserProfile {
+        id: row
+            .try_get::<i32, _>("id")
+            .map_err(internal_error)?
+            .unwrap_or_default(),
+
+        name: row
+            .try_get::<&str, _>("name")
+            .map_err(internal_error)?
+            .unwrap_or_default()
+            .to_string(),
+
+        email: row
+            .try_get::<&str, _>("email")
+            .map_err(internal_error)?
+            .unwrap_or_default()
+            .to_string(),
+
+        role: row
+            .try_get::<&str, _>("role")
+            .map_err(internal_error)?
+            .unwrap_or_default()
+            .to_string(),
+
+        total_bugs_reported: row
+            .try_get::<i32, _>("total_bugs")
+            .map_err(internal_error)?
+            .unwrap_or(0),
+
+        open_bugs_count: row
+            .try_get::<i32, _>("open_bugs")
+            .map_err(internal_error)?
+            .unwrap_or(0),
     }))
 }
+
 
 // GET /api/issues (Public)
 pub async fn get_issues(

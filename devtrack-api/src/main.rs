@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderValue, Method, header},
     routing::{get, patch, post},
 };
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 #[tokio::main]
 async fn main() {
